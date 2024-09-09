@@ -143,7 +143,13 @@ class VCFPredictionBatch:
                      # remove pickled batch
                      os.unlink(os.path.join(self.tmpdir,res))
                      # process : stats are send back as next 'ready for work' result.
-                     msg = self._process_batch(data['tensor_size'],data['batch_ix'], data['data'],data['length'])
+                     try:
+                        msg = self._process_batch(data['tensor_size'],data['batch_ix'], data['data'],data['length'])
+                     except Exception as e:
+                        self.logger.error(f"Error processing batch {data['tensor_size']}|{data['batch_ix']}: {repr(e)}")
+                        # send error message back to server
+                        msg = "Error : {}".format(repr(e))
+
             # send signal to server thread to exit.
             s.send(str.encode('Done'))
             self.logger.info(f"Closing Worker on device {self.device}")

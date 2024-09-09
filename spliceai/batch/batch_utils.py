@@ -33,21 +33,25 @@ logger = logging.getLogger(__name__)
 ###########
 ## routine to create the batches for prediction.
 def prepare_batches(ann, args, tmpdir, prediction_queue,nr_workers): 
-    # create the parser object
-    vcf_reader = VCFReader(ann=ann, 
+    try:
+        # create the parser object
+        vcf_reader = VCFReader(ann=ann, 
                            input_data=args.input_data,
                            prediction_batch_size=args.prediction_batch_size,
                            prediction_queue=prediction_queue,
                            tmpdir=tmpdir,dist=args.distance,     
                           )
-    # parse records
-    vcf_reader.add_records()
-    # finalize last batches
-    vcf_reader.finish(nr_workers)
-    # close the shelf.
-    vcf_reader.shelf_records.close()
-    # stats 
-    logger.info("Read {} vcf records, queued {} predictions".format(vcf_reader.total_vcf_records, vcf_reader.total_predictions))
+        # parse records
+        vcf_reader.add_records()
+        # finalize last batches
+        vcf_reader.finish(nr_workers)
+        # close the shelf.
+        vcf_reader.shelf_records.close()
+        # stats 
+        logger.info("Read {} vcf records, queued {} predictions".format(vcf_reader.total_vcf_records, vcf_reader.total_predictions))
+    except Exception as e:
+        logger.error(f"Error in prepare_batches: {repr(e)}")
+        raise(e)
 
 
 
@@ -105,6 +109,11 @@ def _process_server(clientsocket,device,queue):
         if msg == 'Done':
             logger.debug(f"Stopping thread {device}")
             break
+        elif msg.startswith('Error'):
+            # send finish signal to worker to shut down cleanly
+            clientsocket.sendall(str.encode('Finished'))
+            # then raise the error to the main thread.
+            raise Exception(msg)
         elif not msg == 'Ready for work...':
             logger.info(msg)
         # send/get new item

@@ -16,7 +16,7 @@ import os
 
 from spliceai.batch.batch_utils import prepare_batches,  start_workers,initialize_devices
 from spliceai.utils import Annotator, get_delta_scores
-from spliceai.batch.data_handlers import VCFWriter
+from spliceai.batch.data_handlers import VCFWriter,VCFReader
 
 try:
     from sys.stdin import buffer as std_in
@@ -140,12 +140,28 @@ def run_spliceai_batched(args, ann,devices,mem_per_logical):
     worker_clients, worker_servers, devices = start_workers(prediction_queue,tmpdir,args,devices,mem_per_logical)
 
     ## wait for everything to finish.
+    #   => If exit codes != 0 are detected, the main process will exit with the first non-zero exit code.
+    while True:
+        # any exit codes defined and != 0 ?
+        exit_codes = [p.exitcode for p in worker_servers + [reader] if p.exitcode is not None] + [p.poll() for p in worker_clients if p.poll() is not None]
+        if any(rc != 0 for rc in exit_codes):
+            logging.error("Error encountered Exiting.")
+            # kill all processes
+            for p in worker_servers + [reader]:
+                if p.is_alive():
+                    p.kill()
+            for p in worker_clients:
+                if p.poll() is None:
+                    p.kill()
+            # and exit
+            sys.exit(1) 
+
     # readers sends finish signal to workers
-    logging.debug("Waiting for VCF reader to join")
+    logging.debug("Cleanup VCF reader")
     reader.join()
     logging.debug("Reader joined!")
     # clients receive signal, send it to servers.
-    logging.debug("Waiting for workers to join.")
+    logging.debug("Cleaning up workers.")
     for p in worker_clients:
         # subprocesses : wait()
         p.wait()

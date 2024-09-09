@@ -18,6 +18,15 @@ docker pull cmgantwerpen/spliceai_v1.3:latest
 docker run --gpus all cmgantwerpen/spliceai_v1.3:latest spliceai -h 
 ```
 
+A container including reference and annotation data is available as well:
+
+
+```sh
+docker pull cmgantwerpen/spliceai_v1.3:full
+```
+Note that this version has a larger footprint (12Gb). Data is available for Genome Build hg19 and hg38 under /data/
+
+
 
 The simplest way to install (the original version of) SpliceAI is through pip or conda:
 ```sh
