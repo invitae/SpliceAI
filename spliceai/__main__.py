@@ -136,14 +136,15 @@ def run_spliceai_batched(args, ann,devices,mem_per_logical):
     reader_args={'ann':ann, 'args':args, 'tmpdir':tmpdir, 'prediction_queue': prediction_queue, 'nr_workers': len(devices)}
     reader = Process(target=prepare_batches, kwargs=reader_args) 
     reader.start()    
-    
+    logging.debug("Reader started") 
     worker_clients, worker_servers, devices = start_workers(prediction_queue,tmpdir,args,devices,mem_per_logical)
-
+    logging.debug("workers started")
     ## wait for everything to finish.
     #   => If exit codes != 0 are detected, the main process will exit with the first non-zero exit code.
     while True:
         # any exit codes defined and != 0 ?
         exit_codes = [p.exitcode for p in worker_servers + [reader] if p.exitcode is not None] + [p.poll() for p in worker_clients if p.poll() is not None]
+        logging.debug("exit codes: {}".format(exit_codes))
         if any(rc != 0 for rc in exit_codes):
             logging.error("Error encountered Exiting.")
             # kill all processes
@@ -155,18 +156,21 @@ def run_spliceai_batched(args, ann,devices,mem_per_logical):
                     p.kill()
             # and exit
             sys.exit(1) 
+        if len(exit_codes) == len(worker_servers + [reader] + worker_clients):
+            break
+        time.sleep(30)
 
     # readers sends finish signal to workers
-    logging.debug("Cleanup VCF reader")
+    logging.info("Cleanup VCF reader")
     reader.join()
     logging.debug("Reader joined!")
     # clients receive signal, send it to servers.
-    logging.debug("Cleaning up workers.")
+    logging.info("Cleaning up workers.")
     for p in worker_clients:
         # subprocesses : wait()
         p.wait()
     logging.debug("Workers are done!")
-    logging.debug("Waiting for servers to join.")
+    logging.info("Waiting for servers to join.")
     for p in worker_servers:
         # mp processes : join()
         p.join()
