@@ -1,6 +1,9 @@
 # Original source code modified to add prediction batching support by Invitae in 2021.
 # Modifications copyright (c) 2021 Invitae Corporation.
 
+# Invitae source code modified to improve GPU utilization
+# Modifications made by Geert Vandeweyer (Antwerp University Hospital, Belgium)
+
 import collections
 
 from pkg_resources import resource_filename
@@ -8,15 +11,16 @@ import pandas as pd
 import numpy as np
 from pyfaidx import Fasta
 from keras.models import load_model
+import tensorflow as tf
 import logging
-
+import gc
 
 GeneInfo = collections.namedtuple('GeneInfo', 'genes strands idxs')
 
 
 class Annotator:
 
-    def __init__(self, ref_fasta, annotations):
+    def __init__(self, ref_fasta, annotations,cpu=True):
 
         if annotations == 'grch37':
             annotations = resource_filename(__name__, 'annotations/grch37.txt')
@@ -46,9 +50,13 @@ class Annotator:
         except IOError as e:
             logging.error('{}'.format(e))
             exit()
-
         paths = ('models/spliceai{}.h5'.format(x) for x in range(1, 6))
-        self.models = [load_model(resource_filename(__name__, x)) for x in paths]
+        # use CPU memory for loading models, to prevent gpu memory allocation. 
+        if cpu:
+            with tf.device('CPU:0'):
+                self.models = [load_model(resource_filename(__name__, x)) for x in paths]
+        else:
+            self.models = [load_model(resource_filename(__name__, x)) for x in paths]
 
     def get_name_and_strand(self, chrom, pos):
 
@@ -215,8 +223,8 @@ def get_delta_scores(record, ann, dist_var, mask):
                                        alt_ix=alt_ix,
                                        wid=wid)
 
-            y_ref = np.mean([ann.models[m].predict(x_ref) for m in range(5)], axis=0)
-            y_alt = np.mean([ann.models[m].predict(x_alt) for m in range(5)], axis=0)
+            y_ref = np.mean([ann.models[m].predict(x_ref,verbose=0) for m in range(5)], axis=0)
+            y_alt = np.mean([ann.models[m].predict(x_alt,verbose=0) for m in range(5)], axis=0)
 
             delta_score = get_alt_gene_delta_score(record=record,
                                                    ann=ann,
@@ -228,7 +236,7 @@ def get_delta_scores(record, ann, dist_var, mask):
                                                    gene_info=gene_info,
                                                    mask=mask)
             delta_scores.append(delta_score)
-
+    gc.collect()
     return delta_scores
 
 

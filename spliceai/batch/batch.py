@@ -1,200 +1,181 @@
 # Original source code modified to add prediction batching support by Invitae in 2021.
 # Modifications copyright (c) 2021 Invitae Corporation.
 
-import collections
+# Invitae source code modified to improve GPU utilization
+# Modifications made by Geert Vandeweyer (Antwerp University Hospital, Belgium)
+
 import logging
 import time
-
+import shelve
 import numpy as np
+import os
+import tensorflow as tf
+import pickle
+import gc
+import socket
+import sys
+import argparse
 
-from spliceai.batch.batch_utils import extract_delta_scores, get_preds, encode_batch_records
+#from spliceai.batch.batch_utils import extract_delta_scores, get_preds
+sys.path.append('../../../spliceai')
+from spliceai.batch.batch_utils import   get_preds, initialize_devices, initialize_one_device
+from spliceai.utils import Annotator, get_delta_scores
 
-logger = logging.getLogger(__name__)
+
 
 SequenceType_REF = 0
 SequenceType_ALT = 1
 
 
-BatchLookupIndex = collections.namedtuple(
-    'BatchLookupIndex', 'sequence_type tensor_size batch_index'
-)
+# options : revised from __main__
+def get_options():
 
-PreparedVCFRecord = collections.namedtuple(
-    'PreparedVCFRecord', 'vcf_record gene_info locations'
-)
+    parser = argparse.ArgumentParser(description='Version: 1.3.1')
+    parser.add_argument('-P', '--port', metavar='port', required=True, type=int)    
+    parser.add_argument('-R', '--reference', metavar='reference', required=True,
+                        help='path to the reference genome fasta file')
+    parser.add_argument('-A', '--annotation',metavar='annotation', required=True,
+                        help='"grch37" (GENCODE V24lift37 canonical annotation file in '
+                             'package), "grch38" (GENCODE V24 canonical annotation file in '
+                             'package), or path to a similar custom gene annotation file')
+    parser.add_argument('-T', '--tensorflow_batch_size', metavar='tensorflow_batch_size', type=int,
+                        help='tensorflow batch size for model predictions')
+    parser.add_argument('-V', '--verbose', action='store_true', help='enables verbose logging')
+    parser.add_argument('-t','--tmpdir', metavar='tmpdir',type=str,default='/tmp/',required=False,
+                        help="Use Alternate location to store tmp files. (Note: B=4096 equals to roughly 15Gb of tmp files)")
+    parser.add_argument('-d','--device',metavar='device',type=str,required=True,
+                        help="CPU/GPU device to deploy worker on")
+    parser.add_argument('-S', '--simulated_gpus',metavar='simulated_gpus',default='0',type=int, required=False,
+                        help="For development: simulated logical gpus on a single physical device to simulate a multi-gpu environment")
+    parser.add_argument('-M', '--mem_per_logical', metavar='mem_per_logical',default=0,type=int, required=False, 
+                        help="For simulated GPUs assign this amount of memory (Mb)")
+    parser.add_argument('-G','--gpus',metavar='gpus',type=str,default='all',required=False,
+                        help="Number of GPUs to use for SpliceAI. Provide 'all', or comma-seperated list of GPUs to use. eg '0,2' (first and third). Defaults to 'all'")
+    args = parser.parse_args()
+
+    return args
 
 
+def main():
+    # get arguments
+    args = get_options()
+    if args.verbose:
+        loglevel = logging.DEBUG
+    else:
+        loglevel = logging.INFO
+    logging.basicConfig(
+        format='%(asctime)s %(levelname)s %(name)s: - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        level=loglevel,
+    )
+    logger = logging.getLogger(__name__)
+    
+    # initialize && assign device
+    if args.simulated_gpus > 0:
+        devices = [x for x in initialize_devices(args)[0] if x.name == args.device]
+    else:
+        # no simulation : expose only the requested device to tensor.
+        devices = initialize_one_device(args)
+
+
+    if not devices:
+        logger.error(f"Specified device '{args.device}' not found!")
+        sys.exit(1)
+    device = devices[0].name
+    with tf.device(device):
+        logger.info(f"Working on device {args.device}")
+        # initialize the VCFPredictionBatch, pass (non-masked) device name
+        worker = VCFPredictionBatch(args=args,logger=logger) 
+        # start working !
+        worker.process_batches()
+    # done.
+
+
+
+
+# Class to handle predictions
 class VCFPredictionBatch:
-    def __init__(self, ann, output, dist, mask, prediction_batch_size, tensorflow_batch_size):
-        self.ann = ann
-        self.output = output
-        self.dist = dist
-        self.mask = mask
-        # This is the maximum number of predictions to parse/encode/predict at a time
-        self.prediction_batch_size = prediction_batch_size
-        # This is the size of the batch tensorflow will use to make the predictions
-        self.tensorflow_batch_size = tensorflow_batch_size
+    def __init__(self, args, logger): 
+        self.args = args
+        self.ann = None
+        self.tensorflow_batch_size = args.tensorflow_batch_size
+        self.tmpdir = args.tmpdir
+        self.device = args.device
+        self.logger = logger
 
-        # Batch vars
-        self.batches = {}
-        self.prepared_vcf_records = []
+        # store batches of predictions using 'tensor_size|batch_idx' as key. 
+        self.shelf_preds_name = f"spliceai_preds.{self.device[1:].replace(':','_')}.shelf"
+        self.shelf_preds = shelve.open(os.path.join(self.tmpdir, self.shelf_preds_name))
+        
+    # monitor the queue and submit incoming batches.
+    def process_batches(self):
+        with socket.socket() as s:
+            host = socket.gethostname()  # locahost
+            port = self.args.port
+            try:
+                s.connect((host,port))
+            except Exception as e:
+                raise(e)
+            # first response : server is running
+            res = s.recv(2048)
+            # then start polling queue
+            msg = "Ready for work..."
 
-        # Counts
-        self.batch_predictions = 0
-        self.total_predictions = 0
-        self.total_vcf_records = 0
-
-    def _clear_batch(self):
-        self.batch_predictions = 0
-        self.batches.clear()
-        del self.prepared_vcf_records[:]
-
-    def _process_batch(self):
-        start = time.time()
-        total_batch_predictions = 0
-        logger.debug('Starting process_batch')
-
-        # Sanity check dump of batch sizes
-        batch_sizes = ["{}:{}".format(tensor_size, len(batch)) for tensor_size, batch in self.batches.items()]
-        logger.debug('Batch Sizes: {}'.format(batch_sizes))
-
-        # Collect each batch's predictions
-        batch_preds = {}
-        for tensor_size, batch in self.batches.items():
-            # Convert list of encodings into a proper sized numpy matrix
-            prediction_batch = np.concatenate(batch, axis=0)
-
-            # Run predictions
-            batch_preds[tensor_size] = np.mean(
-                get_preds(self.ann, prediction_batch, self.prediction_batch_size), axis=0
-            )
-
-        # Iterate over original list of vcf records, reconstructing record with annotations
-        for prepared_record in self.prepared_vcf_records:
-            record_predictions = self._write_record(prepared_record, batch_preds)
-            total_batch_predictions += record_predictions
-
-        self._clear_batch()
-        logger.debug('Predictions: {}, VCF Records: {}'.format(self.total_predictions, self.total_vcf_records))
-        duration = time.time() - start
-        preds_per_sec = total_batch_predictions / duration
-        preds_per_hour = preds_per_sec * 60 * 60
-        logger.debug('Finished in {:0.2f}s, per sec: {:0.2f}, per hour: {:0.2f}'.format(duration,
-                                                                                        preds_per_sec,
-                                                                                        preds_per_hour))
-
-    def _write_record(self, prepared_record, batch_preds):
-        record = prepared_record.vcf_record
-        gene_info = prepared_record.gene_info
-        record_predictions = 0
-
-        all_y_ref = []
-        all_y_alt = []
-
-        # Each prediction in the batch is located and put into the correct y
-        for location in prepared_record.locations:
-            # No prediction here
-            if location.tensor_size == 0:
-                if location.sequence_type == SequenceType_REF:
-                    all_y_ref.append(None)
+            # first load annotation
+            if not self.ann:
+                # load annotation 
+                self.ann = Annotator(self.args.reference, self.args.annotation,cpu=True)
+            while True:
+                # send request for work
+                s.send(str.encode(msg))
+                res = s.recv(2048).decode('utf-8')
+                # response can be a job, 'hold on' for empty queue, or 'Done' for all finished.
+                if res == 'Hold On':
+                    msg = 'Ready for work...'
+                    time.sleep(0.1)
+                elif res == 'Finished':
+                    self.logger.info("Worker done. Shutting down")
+                    break
                 else:
-                    all_y_alt.append(None)
-                continue
+                    # got a batch id:
+                     with open(os.path.join(self.tmpdir,res),'rb') as p:
+                         data = pickle.load(p)
+                     # remove pickled batch
+                     os.unlink(os.path.join(self.tmpdir,res))
+                     # process : stats are send back as next 'ready for work' result.
+                     try:
+                        msg = self._process_batch(data['tensor_size'],data['batch_ix'], data['data'],data['length'])
+                     except Exception as e:
+                        self.logger.error(f"Error processing batch {data['tensor_size']}|{data['batch_ix']}: {repr(e)}")
+                        # send error message back to server
+                        msg = "Error : {}".format(repr(e))
 
-            # Extract the prediction from the batch into a list of predictions for this record
-            batch = batch_preds[location.tensor_size]
-            if location.sequence_type == SequenceType_REF:
-                all_y_ref.append(batch[[location.batch_index], :, :])
-            else:
-                all_y_alt.append(batch[[location.batch_index], :, :])
+            # send signal to server thread to exit.
+            s.send(str.encode('Done'))
+            self.logger.info(f"Closing Worker on device {self.device}")
 
-        delta_scores = extract_delta_scores(
-            all_y_ref=all_y_ref,
-            all_y_alt=all_y_alt,
-            record=record,
-            ann=self.ann,
-            dist_var=self.dist,
-            mask=self.mask,
-            gene_info=gene_info,
+
+    def _process_batch(self,tensor_size,batch_ix, prediction_batch,nr_preds):
+        start = time.time()
+        
+        # Sanity check dump of batch sizes
+        self.logger.debug('Tensor size : {} : batch_ix {} : nr.entries : {}'.format(tensor_size, batch_ix , nr_preds))
+
+        # Run predictions && add to shelf.
+        self.shelf_preds["{}|{}".format(tensor_size,batch_ix)] = np.mean(
+            get_preds(self.ann, prediction_batch, self.tensorflow_batch_size), axis=0
         )
+        
+        # status
+        duration = time.time() - start
+        preds_per_sec = nr_preds / duration
+        preds_per_hour = preds_per_sec * 60 * 60
 
-        # If there are predictions, write them to the VCF INFO section
-        if len(delta_scores) > 0:
-            record.info['SpliceAI'] = delta_scores
-            record_predictions += len(delta_scores)
+        msg = 'Device {} : Finished in {:0.2f}s, per sec: {:0.2f}, per hour: {:0.2f}'.format(self.device, duration, preds_per_sec, preds_per_hour)
+        self.logger.debug(msg)
+        return msg
 
-        self.output.write(record)
-        return record_predictions
-
-    def add_record(self, record):
-        """
-        Adds a record to a batch. It'll capture the gene information for the record and
-        save it for later to avoid looking it up again, then it'll encode ref and alt from
-        the VCF record and place the encoded values into lists of matching sizes. Once the
-        encoded values are added, a BatchLookupIndex is created so that after the predictions
-        are made, it knows where to look up the corresponding prediction for the vcf record.
-
-        Once the batch size hits it's capacity, it'll process all the predictions for the
-        encoded batches.
-        """
-
-        self.total_vcf_records += 1
-        # Collect gene information for this record
-        gene_info = self.ann.get_name_and_strand(record.chrom, record.pos)
-
-        # Keep track of how many predictions we're going to make
-        prediction_count = len(record.alts) * len(gene_info.genes)
-        self.batch_predictions += prediction_count
-        self.total_predictions += prediction_count
-
-        # Collect lists of encoded ref/alt sequences
-        x_ref, x_alt = encode_batch_records(record, self.ann, self.dist, gene_info)
-
-        # List of BatchLookupIndex's so we know how to lookup predictions for records from
-        # the batches
-        batch_lookup_indexes = []
-
-        # Process the encodings into batches
-        for var_type, encoded_seq in zip((SequenceType_REF, SequenceType_ALT), (x_ref, x_alt)):
-
-            if len(encoded_seq) == 0:
-                # Add BatchLookupIndex with zeros so when the batch collects the outputs
-                # it knows that there is no prediction for this record
-                batch_lookup_indexes.append(BatchLookupIndex(var_type, 0, 0))
-                continue
-
-            # Iterate over the encoded sequence and drop into the correct batch by size and
-            # create an index to use to pull out the result after batch is processed
-            for row in encoded_seq:
-                # Extract the size of the sequence that was encoded to build a batch from
-                tensor_size = row.shape[1]
-
-                # Create batch for this size
-                if tensor_size not in self.batches:
-                    self.batches[tensor_size] = []
-
-                # Add encoded record to batch
-                self.batches[tensor_size].append(row)
-
-                # Get the index of the record we just added in the batch
-                cur_batch_record_ix = len(self.batches[tensor_size]) - 1
-
-                # Store a reference so we can pull out the prediction for this item from the batches
-                batch_lookup_indexes.append(BatchLookupIndex(var_type, tensor_size, cur_batch_record_ix))
-
-        # Save the batch locations for this record on the composite object
-        prepared_record = PreparedVCFRecord(
-            vcf_record=record, gene_info=gene_info, locations=batch_lookup_indexes
-        )
-        self.prepared_vcf_records.append(prepared_record)
-
-        # If we're reached our threshold for the max items to process, then process the batch
-        if self.batch_predictions >= self.prediction_batch_size:
-            self._process_batch()
-
-    def finish(self):
-        """
-        Method to process all the remaining items that have been added to the batch.
-        """
-        if len(self.prepared_vcf_records) > 0:
-            self._process_batch()
+    
+    
+if __name__ == '__main__':
+    main()

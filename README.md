@@ -9,16 +9,35 @@ This package annotates genetic variants with their predicted effect on splicing,
 SpliceAI source code is provided under the [GPLv3 license](LICENSE). SpliceAI includes several third party packages provided under other open source licenses, please see [NOTICE](NOTICE) for additional details. The trained models used by SpliceAI (located in this package at spliceai/models) are provided under the [CC BY NC 4.0](LICENSE) license for academic and non-commercial use; other use requires a commercial license from Illumina, Inc.
 
 ### Installation
-The simplest way to install SpliceAI is through pip or conda:
+
+This release can most easily be used as a docker container: 
+
+```sh
+docker pull cmgantwerpen/spliceai_v1.3:latest
+
+docker run --gpus all cmgantwerpen/spliceai_v1.3:latest spliceai -h 
+```
+
+A container including reference and annotation data is available as well:
+
+
+```sh
+docker pull cmgantwerpen/spliceai_v1.3:full
+```
+Note that this version has a larger footprint (12Gb). Data is available for Genome Build hg19 and hg38 under /data/
+
+
+
+The simplest way to install (the original version of) SpliceAI is through pip or conda:
 ```sh
 pip install spliceai
 # or
 conda install -c bioconda spliceai
 ```
 
-Alternately, SpliceAI can be installed from the [github repository](https://github.com/Illumina/SpliceAI.git):
+Alternately, SpliceAI can be installed from the [github repository](https://github.com/invitae/SpliceAI.git):
 ```sh
-git clone https://github.com/Illumina/SpliceAI.git
+git clone https://github.com/invitae/SpliceAI.git
 cd SpliceAI
 python setup.py install
 ```
@@ -42,7 +61,7 @@ Required parameters:
  - ```-I```: Input VCF with variants of interest.
  - ```-O```: Output VCF with SpliceAI predictions `ALLELE|SYMBOL|DS_AG|DS_AL|DS_DG|DS_DL|DP_AG|DP_AL|DP_DG|DP_DL` included in the INFO column (see table below for details). Only SNVs and simple INDELs (REF or ALT is a single base) within genes are annotated. Variants in multiple genes have separate predictions for each gene.
  - ```-R```: Reference genome fasta file. Can be downloaded from [GRCh37/hg19](http://hgdownload.cse.ucsc.edu/goldenPath/hg19/bigZips/hg19.fa.gz) or [GRCh38/hg38](http://hgdownload.cse.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz).
- - ```-A```: Gene annotation file. Can instead provide `grch37` or `grch38` to use GENCODE V24 canonical annotation files included with the package. To create custom gene annotation files, use `spliceai/annotations/grch37.txt` in repository as template.
+ - ```-A```: Gene annotation file. Can instead provide `grch37` or `grch38` to use GENCODE V24 canonical annotation files included with the package. To create custom gene annotation files, use `spliceai/annotations/grch37.txt` in repository as template and provide as full path.
 
 Optional parameters:
  - ```-D```: Maximum distance between the variant and gained/lost splice site (default: 50).
@@ -50,33 +69,66 @@ Optional parameters:
  - ```-B```: Number of predictions to collect before running models on them in batch. (default: 1 (don't batch))
  - ```-T```: Internal Tensorflow `predict()` batch size if you want something different from the `-B` value. (default: the `-B` value)
  - ```-V```: Enable verbose logging during run
+ - ```-t```: Specify a location to create the temporary files
+ - ```-G```: Specify the GPU(s) to run on : either indexed (eg : 0,2) or 'all'. (default: 'all')
+ - ```-S```: Simulate *n* multiple GPUs on a single physical device. Used for development only, currently all values above 2 crashed due to memory issues. (default: 0)
+ - ```-P```: Port to use when connecting to the socket (default: 54677, only used in batch mode).
 
-**Batching Considerations:** When setting the batching parameters, be mindful of the system and gpu memory of the machine you 
-are running the script on. Feel free to experiment, but some reasonable `-B` numbers would be 64/128.
+**Batching Considerations:** 
 
-Batching Performance Benchmarks:
+When setting the batching parameters, be mindful of the system and gpu memory of the machine you 
+are running the script on. Feel free to experiment, but some reasonable `-T` numbers would be 64/128. CPU memory is larger, and increasing `-B` might further improve performance.
 
-| Type     | Speed       |
-| -------- | ----------- |
-| n1-standard-2 CPU (GCP) | ~800 per hour |
-| CPU (2019 MacBook Pro) | ~3,000 per hour |
-| K80 GPU (GCP) | ~25,000 per hour |
-| V100 GPU (GCP) | ~150,000 per hour |
+*Batching Performance Benchmarks:*
+- Input data: GATK generated WES sample with ~ 90K variants in genome build GRCh37.
+- Total predictions made : 174,237
+- invitae v2 mainly implements logic to prioritize full batches while predicting 
+- settings : 
+    - invitae & invitae v2 : B = T = 64
+    - invitae v2 optimal : on V100 : B = 4096 ; T = 256 -- on K80/GeForce : B = 4096 ; T = 64
 
-Details of SpliceAI INFO field:
+*Benchmark results*
 
-|    ID    | Description |
-| -------- | ----------- |
-|  ALLELE  | Alternate allele |
-|  SYMBOL  | Gene symbol |
-|  DS_AG   | Delta score (acceptor gain) |
-|  DS_AL   | Delta score (acceptor loss) |
-|  DS_DG   | Delta score (donor gain) |
-|  DS_DL   | Delta score (donor loss) |
-|  DP_AG   | Delta position (acceptor gain) |
-|  DP_AL   | Delta position (acceptor loss) |
-|  DP_DG   | Delta position (donor gain) |
-|  DP_DL   | Delta position (donor loss) |
+| Type                                 | Implementation        | Total Time | Speed (predictions / hour) |
+|--------------------------------------|-----------------------|------------|----------------------------|
+| CPU (intel i5-8365U)<sup>a</sup>     | illumina              | ~100h      | ~1000 pred/h               |
+|                                      | invitae               | ~39h       | ~4500 pred/h               |
+|                                      | invitae v2            | ~35h       | ~5000 pred/h               |
+|                                      | invitae v2 optimal    | ~35h       | ~5000 pred/h               | 
+| K80 GPU (AWS p2.large)               | illumina</sup>b</sup> | ~25 h      | ~7000 pred/h               |
+|                                      | invitae               | 242m       | ~43,000 pred / h           |
+|                                      | invitae v2            | 213m       | ~50,000 pred / h           |
+|                                      | invitae v2 optimal    | 188 m      | ~56,000 pred / h           |
+| GeForce RTX 2070 SUPER GPU (desktop) | illumina</sup>b</sup> | ~10 h      | ~ 17,000 pred/h            |
+|                                      | invitae               | 76m        | ~137,000 pred / h          |
+|                                      | invitae v2            | 63m        | ~166,000 pred / h          |
+|                                      | invitae v2 optimal    | 52m        | ~200,000 pred / h          |
+| V100 GPU (AWS p3.xlarge)             | illumina<sup>b</sup>  | ~10h       | ~18,000 pred/h             |
+|                                      | invitae               | 78m        | ~135,000 pred / h          |
+|                                      | invitae v2            | 54m        | ~190,000 pred / h          |  
+|                                      | invitae v2 optimal    | 31 m       | ~335,000 pred / h          |
+  
+
+<sup>(a)</sup> : Extrapolated from first 500 variants
+
+<sup>(b)</sup> : Illumina implementation showed a memory leak with the installed versions of tf/keras/.... Values extrapolated from incomplete runs at the point of OOM. 
+
+*Note:* On a p3.8xlarge machine, hosting 4 V100 GPU's, we were able reach 1,379,505 predictions/hour ! This is a nearly linear scale-up.
+
+### Details of SpliceAI INFO field:
+
+| ID     | Description                    |
+|--------|--------------------------------|
+| ALLELE | Alternate allele               |
+| SYMBOL | Gene symbol                    |
+| DS_AG  | Delta score (acceptor gain)    |
+| DS_AL  | Delta score (acceptor loss)    |
+| DS_DG  | Delta score (donor gain)       |
+| DS_DL  | Delta score (donor loss)       |
+| DP_AG  | Delta position (acceptor gain) |
+| DP_AL  | Delta position (acceptor loss) |
+| DP_DG  | Delta position (donor gain)    |
+| DP_DL  | Delta position (donor loss)    |
 
 Delta score of a variant, defined as the maximum of (DS_AG, DS_AL, DS_DG, DS_DL), ranges from 0 to 1 and can be interpreted as the probability of the variant being splice-altering. In the paper, a detailed characterization is provided for 0.2 (high recall), 0.5 (recommended), and 0.8 (high precision) cutoffs. Delta position conveys information about the location where splicing changes relative to the variant position (positive values are downstream of the variant, negative values are upstream).
 
@@ -133,5 +185,15 @@ donor_prob = y[0, :, 2]
 * Adds test cases to run a small file using a generated FASTA reference to test if the results are the same with no batching and with different batching sizes
 * Slightly modifies the entrypoint of running the code to allow for easier unit testing. Being able to pass in what would normally come from the argparser
 
+**Multi-GPU support** - Geert Vandeweyer (_November 2022_)
+
+* Offload more code to CPU (eg np to tensor conversion) to *only* perform predictions on the GPU
+* Implement queuing system to always have full batches ready for prediction
+* Implement new parameter, `--tmpdir` to support a custom tmp folder to store prepped batches
+* Implement socket-based client/server approach to scale over multiple GPUs
+
+
 ### Contact
 Kishore Jaganathan: kjaganathan@illumina.com
+
+Geert Vandeweyer (This implementation) : geert.vandeweyer@uza.be
